@@ -116,17 +116,21 @@ properties:
 required: ["bar"]
 """
 
+ALLOF_BAR_SCHEMA = """$schema: "https://json-schema.org/draft/2020-12/schema#"
+type: object
+properties:
+  bar:
+    type: integer
+    default: 42
+required: ["bar"]
+"""
+
 ALLOF_CONFIG_SCHEMA = """$schema: "https://json-schema.org/draft/2020-12/schema#"
 type: object
 properties:
   foo:
     allOf:
-      - type: object
-        properties:
-          bar:
-            type: integer
-            default: 42
-          required: ['bar']
+      - $ref: "bar.schema.yaml"
       - type: object
         properties:
           foo:
@@ -270,6 +274,8 @@ def config_schema_relative_nested_with_default(schemadir):
 def config_schema_allof_default(schemadir):
     p = schemadir.join("config.allof.default.schema.yaml")
     p.write(ALLOF_CONFIG_SCHEMA)
+    bar = schemadir.join("bar.schema.yaml")
+    bar.write(ALLOF_BAR_SCHEMA)
     return p
 
 
@@ -341,6 +347,15 @@ def test_config_ref_relative_with_fragment(config_schema_relative_ref_with_fragm
         validate(config, str(config_schema_relative_ref_with_fragment), set_default=False)
     config = {"bar": {"baz": "value"}}
     validate(config, str(config_schema_relative_ref_with_fragment), set_default=False)
+
+
+def test_config_ref_recursive_default(config_schema_relative_nested_with_default):
+    config = {"bar": {"baz": {}}}
+    validate(config, str(config_schema_relative_nested_with_default), set_default=True)
+    assert config["bar"]["baz"]["qux"] == 42
+    config = {"bar": {"baz": {"qux": 19}}}
+    validate(config, str(config_schema_relative_nested_with_default), set_default=True)
+    assert config["bar"]["baz"]["qux"] == 19
 
 
 def test_config_allof_default(config_schema_allof_default):

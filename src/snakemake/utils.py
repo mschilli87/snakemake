@@ -102,32 +102,81 @@ def validate(data, schema, set_default=True):
         return Resource.from_contents(contents=_load_configfile(urlparse(uri).path, filetype="Schema"))
 
     resource = Resource.from_contents(contents=schema)
-    registry = Registry(retrieve=retrieve_uri).with_resource(
-        uri=schemafile.get_path_or_uri(), resource=resource
-    )
-    Validator = Draft202012Validator(schema, registry=registry)
+    # Register the resource with the absolulte file:// URI set as $id above.
+    registry = Registry(retrieve=retrieve_uri).with_resource(uri=schema["$id"], resource=resource)
 
-    # Taken from https://python-jsonschema.readthedocs.io/en/latest/faq/
-    def extend_with_default(validator_class):
-        validate_properties = validator_class.VALIDATORS["properties"]
+    # RefResolver used to resolve references before validation.
+    # The new referencing API loads the external schemas lazily during validations.
+    # Thus, extending the validator to apply defaults 'on the fly' won't work
+    # as the default settings code would 'see' the still unresolved references.
+    # To resolve this issue (no pun intended), the registry's resolver is used
+    # to 'pre-resolve' the schema before traversing it for defaults.
+    resolver = registry.resolver(base_uri=schema["$id"])
 
-        def set_defaults(validator, properties, instance, schema):
-            for property, subschema in properties.items():
-                if "default" in subschema:
-                    instance.setdefault(property, subschema["default"])
+    # Helper function to resolve the schema recursively.
+    def _resolve_ref(node):
+        if isinstance(node, dict):
+            # If this node is just a $ref (no siblings) -> replace with resolved contents
+            if "$ref" in node and isinstance(node["$ref"], str):
+                ref = node["$ref"]
+                resolved = resolver.lookup(ref)
+                resolved_contents = resolved.contents
+                # If the original node had sibling keys besides "$ref", merge them
+                # on top of the resolved contents (local keys take precedence).
+                # Use keys from node excluding "$ref"
+                local_siblings = {k: v for k, v in node.items() if k != "$ref"}
+                if local_siblings:
+                    # Merge: resolved_contents <- local_siblings (local overrides)
+                    if isinstance(resolved_contents, dict):
+                        resolved_contents.update(local_siblings)
+                    else:
+                        resolved_contents = local_siblings
 
-            for error in validate_properties(
-                validator,
-                properties,
-                instance,
-                schema,
-            ):
-                yield error
+                # Recurse into the merged result using the resolver returned by the lookup,
+                # because relative refs inside the resolved resource should be resolved
+                # relative to that resource's base URI.
+                return _resolve_ref(resolved_contents)
+            # Regular dict: recurse into all values
+            return {k: _resolve_ref(v) for k, v in node.items()}
+        elif isinstance(node, list):
+            # List: recurse into all items
+            return [_resolve_ref(v) for v in node]
+        else:
+            # Leave: End recursion.
+            return node
 
-        return validators.extend(
-            validator_class,
-            {"properties": set_defaults},
-        )
+    # Helper function to apply defaults from the (pre-resolved) schema recursively.
+    def _apply_defaults(instance, schema):
+        # Defaults are only filled for objects, for backwards compatibility
+        # with the old (RefResolver based) implementation.
+        if not isinstance(instance, dict):
+            return
+        # The old (RefResolver based) implementation merged defaults from allOf
+        # and anyOf subschemas. Recurse to match that behaviour.
+        for key in ("allOf", "anyOf"):
+            for subschema in schema.get(key, []):
+                _apply_defaults(instance, subschema)
+        # Again, to keep compatibility with the old (RefResolver based)
+        # implementation, defaults are only filled for properties and in a
+        # shallow-fashion, i.e. recurse only for properties listed on that
+        # level:
+        for key, subschema in schema.get("properties", {}).items():
+            if key not in instance:
+                if isinstance(subschema, dict) and "default" in subschema:
+                    instance[key] = subschema["default"]
+                elif isinstance(subschema, dict) and "properties" in subschema:
+                    instance[key] = {}
+            if key in instance and isinstance(subschema, dict):
+                _apply_defaults(instance[key], subschema)
+
+    # Pre-resolve the schema and use the fully resolved schema for validation
+    # if defaults need to be filled (see above).
+    if set_default:
+        resolved_schema = _resolve_ref(schema)
+        Validator = Draft202012Validator(resolved_schema, registry=registry)
+        _apply_defaults(data, resolved_schema)
+    else:
+         Validator = Draft202012Validator(schema, registry=registry)
 
     if Validator.META_SCHEMA["$schema"] != schema["$schema"]:
         logger.warning(
@@ -137,14 +186,13 @@ def validate(data, schema, set_default=True):
             f"Defaulting to validator for JSON Schema version '{Validator.META_SCHEMA['$schema']}'"
         )
         logger.warning("Note that schema file may not be validated correctly.")
-    Defaultvalidator = extend_with_default(Validator)
+
 
     def _validate_record(record):
+        # Note: Defaults have already been applied globally above (if specified).
+        Validator.validate(record)
         if set_default:
-            Defaultvalidator(schema, registry=registry).validate(record)
             return record
-        else:
-            Validator.validate(record)
 
     def _validate_pandas(data):
         try:
@@ -157,6 +205,8 @@ def validate(data, schema, set_default=True):
                 for i, record in enumerate(data.to_dict("records")):
                     # Exclude NULL values
                     record = {k: v for k, v in record.items() if pd.notnull(v)}
+                    if set_default:
+                        _apply_defaults(record, resolved_schema)
                     try:
                         recordlist.append(_validate_record(record))
                     except jsonschema.exceptions.ValidationError as e:
@@ -193,6 +243,9 @@ def validate(data, schema, set_default=True):
                         for k, v in record.items()
                         if pl.Series(k, [v]).is_not_null().all()
                     }
+                    if set_default:
+                        if isinstance(record, dict):
+                            _apply_defaults(record, resolved_schema)
                     try:
                         recordlist.append(_validate_record(record))
                     except jsonschema.exceptions.ValidationError as e:
